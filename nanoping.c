@@ -19,23 +19,20 @@
 
 //#define NDEBUG
 
-static void usage(const char * name)
+static void __attribute__((noreturn)) usage(const char *name)
 {
-	printf("%s\n", name);
+	printf("\n%s\n", name);
 	printf("\t -i interface\n");
 	printf("\t -d destination IPv4 address\n");
 	printf("\n");
+
+	exit(1);
 }
 
-#define time_diff(r, y, x)                                                     \
-    do {                                                                       \
-        (r)->tv_sec = (x)->tv_sec - (y)->tv_sec;                               \
-        (r)->tv_nsec = (x)->tv_nsec - (y)->tv_nsec;                            \
-        if ((r)->tv_nsec < 0) {                                                \
-            --(r)->tv_sec;                                                     \
-            (r)->tv_nsec += 1000000000;                                        \
-        }                                                                      \
-    } while (0)
+static inline uint64_t time_diff(const struct timespec *ts0, const struct timespec *ts1)
+{
+	return ((1e9 * (ts1->tv_sec - ts0->tv_sec)) + (ts1->tv_nsec - ts0->tv_nsec));
+}
 
 static bool done = false;
 
@@ -44,7 +41,7 @@ static void timeout(int signum)
 	done = true;
 }
 
-static void tx(int sock, struct sockaddr *addr, socklen_t addr_len)
+static bool tx(int sock, struct sockaddr *addr, socklen_t addr_len)
 {
 	int res;
 
@@ -53,11 +50,20 @@ static void tx(int sock, struct sockaddr *addr, socklen_t addr_len)
 		fprintf(stderr, "%s: %s\n", "sendto", strerror(errno));
 	else
 		printf("success\n");
+
+	return true;
 }
 
-static bool rx(void)
+static bool rx(int sock)
 {
 	return true;
+}
+
+static void read_timestamp(int sock, struct timespec *ts)
+{
+	ts->tv_sec = 0;
+	ts->tv_nsec = 0;
+	return;
 }
 
 int main(int argc, char **argv)
@@ -81,13 +87,11 @@ int main(int argc, char **argv)
 				break;
 			default:
 				usage(argv[0]);
-				return 0;
 		}
 	}
 
 	if (ifname == 0 || dst == 0) {
 		usage(argv[0]);
-		return 0;
 	}
 
 	// tx	
@@ -125,14 +129,16 @@ int main(int argc, char **argv)
 
 	signal(SIGALRM, &timeout);
 
-	const struct itimerval timer = {.it_value.tv_sec = 1};
+	const struct itimerval timer = {.it_value.tv_sec = 1, .it_value.tv_usec = 0};
 	const struct itimerval stop = {{0}};
 	while (1) {
 		struct timespec ts0, ts1;
-		struct timespec diff;
+		uint64_t diff;
 		
 		// send the packet
-		tx(sock_tx, (struct sockaddr *)&addr_tx, sizeof(addr_tx));
+		res = tx(sock_tx, (struct sockaddr *)&addr_tx, sizeof(addr_tx));
+		if (res == true)
+			read_timestamp(sock_tx, &ts0);
 
 		// get the current time
 		clock_gettime(CLOCK_MONOTONIC, &ts0);
@@ -142,9 +148,10 @@ int main(int argc, char **argv)
 		done = false;
 
 		// wait for a replay
-		while (likely(done == false)) {
-			res = rx();
-			if (res == true)
+		while (likely(done == false)) {  // timeout
+			res = rx(sock_rx);
+			if (res == true)  // success
+				read_timestamp(sock_rx, &ts1);
 				break;
 		}
 
@@ -155,8 +162,10 @@ int main(int argc, char **argv)
 		setitimer(ITIMER_REAL, &stop, 0);
 
 		// print RTT
-		time_diff(&diff, &ts0, &ts1);
-		printf("diff: %ld\n", diff.tv_nsec);
+		diff = time_diff(&ts0, &ts1);
+		printf("diff: %lld\n", diff);
+
+		sleep(1);
 	}
 
 	close(sock_tx);
