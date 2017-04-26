@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <time.h>
 
+#include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
@@ -16,6 +17,10 @@
 
 #define likely(x)      __builtin_expect(!!(x), 1)
 #define unlikely(x)    __builtin_expect(!!(x), 0)
+
+#ifndef MSG_ERRQUEUE
+#define MSG_ERRQUEUE    0x2000
+#endif
 
 //#define NDEBUG
 
@@ -54,16 +59,47 @@ static bool tx(int sock, struct sockaddr *addr, socklen_t addr_len)
 	return true;
 }
 
-static bool rx(int sock)
+static bool _recvpkt(int sock, struct timespec *ts, int recvmsg_flags)
 {
+	struct sockaddr_in sin;
+	struct iovec entry;
+	struct msghdr msg = {0};
+	char buf[256];
+	struct {
+		struct cmsghdr cmsg;
+		char cbuf[512];
+	} ctrl;
+	int res;
+
+	msg.msg_iov = &entry;
+	msg.msg_iovlen = 1;
+	entry.iov_base = buf;
+	entry.iov_len = sizeof(buf);
+	msg.msg_name = (caddr_t)&sin;
+	msg.msg_namelen = sizeof(sin);
+	msg.msg_control = &ctrl;
+	msg.msg_controllen = sizeof(ctrl);
+
+	res = recvmsg(sock, &msg, MSG_DONTWAIT | MSG_ERRQUEUE);
+	if (res < 0) {
+		fprintf(stderr, "%s: %s\n", "recvmsg", strerror(errno));
+	} else {
+		printf("recvmsg: success\n");
+	}
+
 	return true;
 }
 
-static void read_timestamp(int sock, struct timespec *ts)
+static inline bool rx(int sock)
 {
-	ts->tv_sec = 0;
-	ts->tv_nsec = 0;
-	return;
+	return _recvpkt(sock, NULL, 0);
+}
+
+static inline void read_timestamp(int sock, struct timespec *ts)
+{
+	bool res;
+
+	res = _recvpkt(sock, ts, MSG_ERRQUEUE);
 }
 
 int main(int argc, char **argv)
@@ -137,7 +173,7 @@ int main(int argc, char **argv)
 		
 		// send the packet
 		res = tx(sock_tx, (struct sockaddr *)&addr_tx, sizeof(addr_tx));
-		if (res == true)
+		if (res)
 			read_timestamp(sock_tx, &ts0);
 
 		// get the current time
@@ -150,7 +186,7 @@ int main(int argc, char **argv)
 		// wait for a replay
 		while (likely(done == false)) {  // timeout
 			res = rx(sock_rx);
-			if (res == true)  // success
+			if (res)                     // success
 				read_timestamp(sock_rx, &ts1);
 				break;
 		}
