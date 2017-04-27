@@ -1,4 +1,3 @@
 nanoping
 *.o
-*.c
-^nanoping.c
+build
