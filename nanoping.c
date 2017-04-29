@@ -31,6 +31,11 @@
 #define MSG_ERRQUEUE    0x2000
 #endif
 
+struct hw_timestamp {
+	struct timespec ts;
+	struct timespec sw;
+};
+
 //#define NDEBUG
 
 static void __attribute__((noreturn)) usage(const char *name)
@@ -69,81 +74,72 @@ static bool tx(int sock, struct sockaddr *addr, socklen_t addr_len)
 	return true;
 }
 
-static void print_timestamp(struct scm_timestamping *tss, int tstype, int tskey, int payload_len)
+
+int sk_tx_timeout = 1000;
+static short sk_events = POLLPRI;
+static short sk_revents = POLLPRI;
+
+static int _recvpkt(int fd, struct hw_timestamp *hwts, int recvmsg_flags)
 {
-	struct timespec *cur = &tss->ts[0];
-
-	if (!(cur->tv_sec | cur->tv_nsec))
-		return;
-
-	fprintf(stderr, "  %lu s %lu us (seq=%u, len=%u)",
-		cur->tv_sec, cur->tv_nsec / 1000, tskey, payload_len);
-	
-}
-
-static void _recv_errmsg_cmsg(struct msghdr *msg, int payload_len)
-{
-	struct sock_extended_err *serr = NULL;
-	struct scm_timestamping *tss = NULL;
-	struct cmsghdr *cm;
-	int batch = 0;
-	
-	for (cm = CMSG_FIRSTHDR(msg); cm && cm->cmsg_len; cm = CMSG_NXTHDR(msg, cm)) {
-		if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_TIMESTAMPING) {
-			tss = (void *) CMSG_DATA(cm);
-		} else if ((cm->cmsg_level == SOL_IP && cm->cmsg_type == IP_RECVERR) ||
-			   (cm->cmsg_level == SOL_IPV6 && cm->cmsg_type == IPV6_RECVERR)) {
-			serr = (void *) CMSG_DATA(cm);
-			if (serr->ee_errno != ENOMSG || serr->ee_origin != SO_EE_ORIGIN_TIMESTAMPING) {
-				fprintf(stderr, "unknown ip error %d %d\n", serr->ee_errno, serr->ee_origin);
-				serr = NULL;
-			}
-		} else {
-			fprintf(stderr, "unknown cmsg %d,%d\n", cm->cmsg_level, cm->cmsg_type);
-		}
-
-		if (serr && tss) {
-			print_timestamp(tss, serr->ee_info, serr->ee_data, payload_len);
-			serr = NULL;
-			tss = NULL;
-			batch++;
-		}
-	}
-	if (batch > 1)
-		fprintf(stderr, "batched %d timestamps\n", batch);
-
-}
-
-static int _recvpkt(int sock, struct timespec *ts, int recvmsg_flags)
-{
+	struct timespec *ts = NULL;
 	struct sockaddr_in sin;
-	struct iovec entry;
+	struct iovec iov;
 	struct msghdr msg = {0};
-	char buf[256];
-	struct {
-		struct cmsghdr cmsg;
-		char cbuf[512];
-	} ctrl;
+	char ctrl[512] = {};
+	char buf[256] = {};
+	int level, type;
+	int count = 0;
 	int res = 0;
 
-	msg.msg_iov = &entry;
+	struct cmsghdr *cm;
+
+	msg.msg_iov = &iov;
 	msg.msg_iovlen = 1;
-	entry.iov_base = buf;
-	entry.iov_len = sizeof(buf);
-	msg.msg_name = (caddr_t)&sin;
-	msg.msg_namelen = sizeof(sin);
 	msg.msg_control = &ctrl;
 	msg.msg_controllen = sizeof(ctrl);
+	msg.msg_name = (caddr_t)&sin;
+	msg.msg_namelen = sizeof(sin);
 
-	res = recvmsg(sock, &msg, MSG_ERRQUEUE);
-	if (res < 0) {
+	iov.iov_base = &buf;
+	iov.iov_len = sizeof(buf);
+
+	if (recvmsg_flags == MSG_ERRQUEUE) {
+		struct pollfd pfd = { fd, sk_events, 0 };
+		res = poll(&pfd, 1, sk_tx_timeout);
+		if (res < 1) {
+			fprintf(stderr, "%s: res=%d: %s\n", "poll: tx timestamp", res, strerror(errno));
+			return res;
+		} else if (!(pfd.revents & sk_revents)) {
+			fprintf(stderr, "%s: %s\n", "poll: non ERR event", strerror(errno));
+			return -1;
+		}
+	}
+
+	count = recvmsg(fd, &msg, recvmsg_flags);
+	if (count < 1) {
 		fprintf(stderr, "%s: %s\n", "recvmsg", strerror(errno));
 	} else {
 		printf("recvmsg: success\n");
-		_recv_errmsg_cmsg(&msg, res);
 	}
 
-	return res == -1;
+	for (cm = CMSG_FIRSTHDR(&msg); cm != NULL; cm = CMSG_NXTHDR(&msg, cm)) {
+		level = cm->cmsg_level;
+		type = cm->cmsg_type;
+		if (level == SOL_SOCKET && type == SO_TIMESTAMPING) {
+			ts = (struct timespec *)CMSG_DATA(cm);	
+		}
+		if (level == SOL_SOCKET && type == SO_TIMESTAMPNS) {
+			//sw = (struct timespec *)CMSG_DATA(cm);	
+			//hwts = *sw;
+			;
+		}
+	}
+
+	printf("ts0: %lld.%.9ld\n", (long long)ts[0].tv_sec, ts[0].tv_nsec);
+	printf("ts1: %lld.%.9ld\n", (long long)ts[1].tv_sec, ts[1].tv_nsec);
+	printf("ts2: %lld.%.9ld\n", (long long)ts[2].tv_sec, ts[2].tv_nsec);
+
+	return count;
 }
 
 static inline bool rx(int sock)
@@ -151,24 +147,10 @@ static inline bool rx(int sock)
 	return _recvpkt(sock, NULL, 0);
 }
 
-static inline bool read_timestamp(int sock, struct timespec *ts)
+static inline bool read_timestamp(int fd, struct hw_timestamp *hwts)
 {
 
-	return _recvpkt(sock, ts, MSG_ERRQUEUE);
-}
-
-static void __poll(int fd)
-{
-	struct pollfd pollfd;
-	int ret;
-
-	memset(&pollfd, 0, sizeof(pollfd));
-	pollfd.fd = fd;
-	ret = poll(&pollfd, 1, 100);
-	if (ret != 1) {
-		printf("hoge\n");
-		error(1, errno, "poll");
-	}
+	return _recvpkt(fd, hwts, MSG_ERRQUEUE);
 }
 
 int main(int argc, char **argv)
@@ -179,8 +161,8 @@ int main(int argc, char **argv)
 	const char *ifname = 0;
 	const char *dst = 0;
 
+	unsigned int txsockopt = SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE;
 	struct sockaddr_in addr_tx = {0}, addr_rx = {0};
-	const int nonblocking = 1;
 	int sock_tx, sock_rx;
 	struct ifreq dev;
 	int res;
@@ -244,6 +226,12 @@ int main(int argc, char **argv)
 	addr_tx.sin_port = htons(12345);
 	addr_tx.sin_addr.s_addr = inet_addr(dst);
 
+	if (setsockopt(sock_tx, SOL_SOCKET, SO_TIMESTAMPING, (char *)&txsockopt, sizeof(txsockopt)))
+		error(1, 0, "setsockopt timestamping");
+	if (setsockopt(sock_tx, SOL_SOCKET, SO_SELECT_ERR_QUEUE, (char *)&txsockopt, sizeof(txsockopt)))
+		error(1, 0, "setsockopt timestamping");
+
+
 	// rx
 	sock_rx = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sock_rx < 0) {
@@ -257,27 +245,24 @@ int main(int argc, char **argv)
 
 	bind(sock_rx, (struct sockaddr *)&addr_rx, sizeof(addr_rx));
 
-	ioctl(sock_rx, FIONBIO, &nonblocking);
-
 	signal(SIGALRM, &timeout);
 
 	const struct itimerval timer = {.it_value.tv_sec = 1, .it_value.tv_usec = 0};
-	const struct itimerval stop = {{0}};
+	const struct itimerval stop = {.it_value.tv_sec = 0, .it_value.tv_usec = 0};
 	while (1) {
-		struct timespec ts0, ts1;
+		struct hw_timestamp hwts0, hwts1;
 		uint64_t diff;
 		
 		// send the packet
 		res = tx(sock_tx, (struct sockaddr *)&addr_tx, sizeof(addr_tx));
 		if (res) {
-			usleep(50 * 1000);
-			__poll(sock_tx);
-			while (!(res = read_timestamp(sock_tx, &ts0))) {}
+			res = read_timestamp(sock_tx, &hwts0);
 		}
 
 		// get the current time
-		clock_gettime(CLOCK_MONOTONIC, &ts0);
+//		clock_gettime(CLOCK_MONOTONIC, &ts0);
 
+#if 0
 		// set a timeout
 		setitimer(ITIMER_REAL, &timer, 0);
 		done = false;
@@ -286,21 +271,22 @@ int main(int argc, char **argv)
 		while (likely(done == false)) {  // timeout
 			res = rx(sock_rx);
 			if (res)                     // success
-				res = read_timestamp(sock_rx, &ts1);
+				res = read_timestamp(sock_rx, &hwts1);
 				break;
 		}
 
 		// get the current time
-		clock_gettime(CLOCK_MONOTONIC, &ts1);
+//		clock_gettime(CLOCK_MONOTONIC, &ts1);
 
 		// stop the timeout
 		setitimer(ITIMER_REAL, &stop, 0);
 
 		// print RTT
-		diff = time_diff(&ts0, &ts1);
+		diff = time_diff(&hwts0.ts, &hwts1.ts);
 		printf("diff: %ld\n", diff);
 
-		sleep(1);
+#endif
+		sleep(1); // todo
 	}
 
 	close(sock_tx);
