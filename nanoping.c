@@ -157,6 +157,60 @@ static inline ssize_t read_timestamp(int fd, struct hw_timestamp *hwts)
 	return _recvpkt(fd, hwts, MSG_ERRQUEUE);
 }
 
+static int txsock_init(const char *ifname, const char *dst, struct sockaddr_in *addr)
+{
+	unsigned int txskopt = SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE;
+	struct ifreq dev;
+	int fd;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) {
+		pr_err("%s: %s", "socket", strerror(errno));
+		goto err;
+	}
+
+	memset(&dev, 0, sizeof(dev));
+	strncpy(dev.ifr_name, ifname, sizeof(dev.ifr_name));
+	if (ioctl(fd, SIOCGIFADDR, &dev) < 0) {
+		pr_err("%s: %s", "ioctl: SIOCGIFADDR", strerror(errno));
+		goto err;
+	}
+
+	addr->sin_family = AF_INET;
+	addr->sin_port = htons(12345);
+	addr->sin_addr.s_addr = inet_addr(dst);
+
+	if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPING, (char *)&txskopt, sizeof(txskopt))) {
+		pr_err("%s: %s", "setsockopt timestamping", strerror(errno));
+	}	
+	if (setsockopt(fd, SOL_SOCKET, SO_SELECT_ERR_QUEUE, (char *)&txskopt, sizeof(txskopt))) {
+		pr_err("%s: %s", "setsockopt timestamping", strerror(errno));
+	}
+
+err:
+	return fd;
+}
+
+static int rxsock_init(const char *ifname, struct sockaddr_in *addr)
+{
+	int fd;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) {
+		pr_err("%s: %s", "socket", strerror(errno));
+		goto err;
+	}
+
+	addr->sin_family = AF_INET;
+	addr->sin_port = htons(12345);
+	addr->sin_addr.s_addr = INADDR_ANY;
+
+	bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+
+err:
+	return fd;
+}
+
 int main(int argc, char **argv)
 {
 	// getopt
@@ -166,12 +220,8 @@ int main(int argc, char **argv)
 	const char *ifname = 0;
 	const char *dst = 0;
 
-	unsigned int txskopt = SOF_TIMESTAMPING_TX_HARDWARE |
-	                       SOF_TIMESTAMPING_RAW_HARDWARE;
-	struct sockaddr_in addr_tx = {0}, addr_rx = {0};
+	struct sockaddr_in addr_tx, addr_rx;
 	int sock_tx, sock_rx;
-	struct ifreq dev;
-	ssize_t count;
 	int res;
 
 	int ch;
@@ -223,42 +273,19 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	// tx	
-	sock_tx = socket(AF_INET, SOCK_DGRAM, 0);
+	// tx setup
+	sock_tx = txsock_init(ifname, dst, &addr_tx);
 	if (sock_tx < 0) {
-		pr_err("%s: %s", "socket", strerror(errno));
+		pr_err("%s: %s", "tx socket", strerror(errno));
 		exit(1);
 	}
 
-	memset(&dev, 0, sizeof(dev));
-	strncpy(dev.ifr_name, ifname, sizeof(dev.ifr_name));
-	if (ioctl(sock_tx, SIOCGIFADDR, &dev) < 0) {
-		pr_err("%s: %s", "ioctl: SIOCGIFADDR", strerror(errno));
-		exit(1);
-	}
-
-	addr_tx.sin_family = AF_INET;
-	addr_tx.sin_port = htons(12345);
-	addr_tx.sin_addr.s_addr = inet_addr(dst);
-
-	if (setsockopt(sock_tx, SOL_SOCKET, SO_TIMESTAMPING, (char *)&txskopt, sizeof(txskopt)))
-		error(1, 0, "setsockopt timestamping");
-	if (setsockopt(sock_tx, SOL_SOCKET, SO_SELECT_ERR_QUEUE, (char *)&txskopt, sizeof(txskopt)))
-		error(1, 0, "setsockopt timestamping");
-
-
-	// rx
-	sock_rx = socket(AF_INET, SOCK_DGRAM, 0);
+	// rx setup
+	sock_rx = rxsock_init(ifname, &addr_rx);
 	if (sock_rx < 0) {
-		pr_err("%s: %s", "socket", strerror(errno));
+		pr_err("%s: %s", "rx socket", strerror(errno));
 		exit(1);
 	}
-
-	addr_rx.sin_family = AF_INET;
-	addr_rx.sin_port = htons(12345);
-	addr_rx.sin_addr.s_addr = INADDR_ANY;
-
-	bind(sock_rx, (struct sockaddr *)&addr_rx, sizeof(addr_rx));
 
 	signal(SIGALRM, &timeout);
 
@@ -267,6 +294,7 @@ int main(int argc, char **argv)
 	while (1) {
 		struct hw_timestamp hwts0, hwts1;
 		uint64_t diff;
+		ssize_t count;
 		
 		// send the packet
 		count = tx(sock_tx, (struct sockaddr *)&addr_tx, sizeof(addr_tx));
