@@ -62,6 +62,7 @@ static bool done = false;
 
 static void timeout(int signum)
 {
+	pr_info("timeout");
 	done = true;
 }
 
@@ -146,9 +147,25 @@ static ssize_t _recvpkt(int fd, struct hw_timestamp *hwts, int recvmsg_flags)
 	return count;
 }
 
-static inline ssize_t rx(int sock)
+static ssize_t rx(int fd)
 {
-	return _recvpkt(sock, NULL, 0);
+	struct sockaddr_in sin;
+	struct iovec iov;
+	struct msghdr msg = {0};
+	char ctrl[512] = {};
+	char buf[256] = {};
+
+	iov.iov_base = &buf;
+	iov.iov_len = sizeof(buf);
+
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+	msg.msg_control = &ctrl;
+	msg.msg_controllen = sizeof(ctrl);
+	msg.msg_name = (caddr_t)&sin;
+	msg.msg_namelen = sizeof(sin);
+
+	return recvmsg(fd, &msg, MSG_DONTWAIT);
 }
 
 static inline ssize_t read_timestamp(int fd, struct hw_timestamp *hwts)
@@ -188,11 +205,13 @@ static int txsock_init(const char *ifname, const char *dst, struct sockaddr_in *
 	}
 
 err:
+	pr_info("txfd=%d", fd);
 	return fd;
 }
 
 static int rxsock_init(const char *ifname, struct sockaddr_in *addr)
 {
+	struct ifreq dev;
 	int fd;
 
 	fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -201,13 +220,21 @@ static int rxsock_init(const char *ifname, struct sockaddr_in *addr)
 		goto err;
 	}
 
+	memset(&dev, 0, sizeof(dev));
+	strncpy(dev.ifr_name, ifname, sizeof(dev.ifr_name));
+	if (ioctl(fd, SIOCGIFADDR, &dev) < 0) {
+		pr_err("%s: %s", "ioctl: SIOCGIFADDR", strerror(errno));
+		goto err;
+	}
+
 	addr->sin_family = AF_INET;
-	addr->sin_port = htons(12345);
+	addr->sin_port = htons(12346);
 	addr->sin_addr.s_addr = INADDR_ANY;
 
-	bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+	bind(fd, (struct sockaddr *)addr, sizeof(struct sockaddr));
 
 err:
+	pr_info("rxfd=%d", fd);
 	return fd;
 }
 
@@ -291,46 +318,42 @@ int main(int argc, char **argv)
 
 	const struct itimerval timer = {.it_value.tv_sec = 1, .it_value.tv_usec = 0};
 	const struct itimerval stop = {.it_value.tv_sec = 0, .it_value.tv_usec = 0};
+	struct hw_timestamp hwts0, hwts1;
+	uint64_t diff;
 	while (1) {
-		struct hw_timestamp hwts0, hwts1;
-		uint64_t diff;
 		ssize_t count;
 		
-		// send the packet
-		count = tx(sock_tx, (struct sockaddr *)&addr_tx, sizeof(addr_tx));
-		if (count > 0) {
-			count = read_timestamp(sock_tx, &hwts0);
+		if (ping_mode == PING_MODE) {
+			// send the packet
+			count = tx(sock_tx, (struct sockaddr *)&addr_tx, sizeof(addr_tx));
+
+			// get the TX timestamp from NIC
+			if (count > 0)
+				count = read_timestamp(sock_tx, &hwts0);
+
+			// set a timeout
+			setitimer(ITIMER_REAL, &timer, 0);
+			done = false;
+
+			// wait for a replay
+			while (done == false) {  // timeout
+				count = rx(sock_rx);
+				if (count > 0) {
+					pr_info("captured");
+					break;
+				}
+			}
+
+			// stop the timeout
+			setitimer(ITIMER_REAL, &stop, 0);
 		}
 
-		// get the current time
-//		clock_gettime(CLOCK_MONOTONIC, &ts0);
-
-#if 0
-		// set a timeout
-		setitimer(ITIMER_REAL, &timer, 0);
-		done = false;
-
-		// wait for a replay
-		while (likely(done == false)) {  // timeout
-			res = rx(sock_rx);
-			if (res)                     // success
-				res = read_timestamp(sock_rx, &hwts1);
-				break;
-		}
-
-		// get the current time
-//		clock_gettime(CLOCK_MONOTONIC, &ts1);
-
-		// stop the timeout
-		setitimer(ITIMER_REAL, &stop, 0);
-
-		// print RTT
-		diff = time_diff(&hwts0.ts, &hwts1.ts);
-		printf("diff: %ld\n", diff);
-
-#endif
-		sleep(1); // todo
+		pr_info("-----------------");
 	}
+
+	// print RTT
+	diff = time_diff(&hwts0.ts, &hwts1.ts);
+	printf("diff: %ld\n", diff);
 
 	close(sock_tx);
 	close(sock_rx);
