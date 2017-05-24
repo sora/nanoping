@@ -8,7 +8,6 @@
 #include <error.h>
 #include <errno.h>
 #include <time.h>
-#include <poll.h>
 #include <signal.h>
 
 #include <net/if.h>
@@ -105,6 +104,7 @@ static int __recvmsg(int fd, struct hw_timestamp *ts, int recvmsg_flags)
 	iov.iov_base = &buf;
 	iov.iov_len = sizeof(buf);
 
+/*
 	if (recvmsg_flags == MSG_ERRQUEUE) {
 		struct pollfd pfd = { fd, POLLPRI, 0 };
 		res = poll(&pfd, 1, 1);
@@ -116,6 +116,7 @@ static int __recvmsg(int fd, struct hw_timestamp *ts, int recvmsg_flags)
 			goto err;
 		}
 	}
+*/
 
 	count = recvmsg(fd, &msg, recvmsg_flags);
 	if (count < 1) {
@@ -148,13 +149,18 @@ static inline int read_tstamp(int fd, struct hw_timestamp *ts)
 	return __recvmsg(fd, ts, MSG_ERRQUEUE);
 }
 
-static ssize_t rx(int fd)
+static ssize_t rx(int fd, struct hw_timestamp *ts)
 {
+	struct timespec *tstmp = NULL;
 	struct sockaddr_in sin;
 	struct iovec iov;
 	struct msghdr msg = {0};
 	char ctrl[512] = {};
 	char buf[256] = {};
+	ssize_t count;
+	int level, type;
+
+	struct cmsghdr *cm;
 
 	iov.iov_base = &buf;
 	iov.iov_len = sizeof(buf);
@@ -166,7 +172,21 @@ static ssize_t rx(int fd)
 	msg.msg_name = (caddr_t)&sin;
 	msg.msg_namelen = sizeof(sin);
 
-	return recvmsg(fd, &msg, MSG_DONTWAIT);
+	count = recvmsg(fd, &msg, MSG_DONTWAIT);
+
+	for (cm = CMSG_FIRSTHDR(&msg); cm != NULL; cm = CMSG_NXTHDR(&msg, cm)) {
+		level = cm->cmsg_level;
+		type = cm->cmsg_type;
+		if (level == SOL_SOCKET && type == SO_TIMESTAMPING) {
+			tstmp = (struct timespec *)CMSG_DATA(cm);
+			memcpy(&ts->hw, &tstmp[2], sizeof(struct timespec));
+
+			goto out;
+		}
+	}
+
+out:
+	return count;
 }
 
 
@@ -207,10 +227,7 @@ err:
 
 static int rxsock_init(const char *ifname, struct sockaddr_in *addr)
 {
-	//unsigned int rxskopt = SOF_TIMESTAMPING_RX_HARDWARE;
-	unsigned int rxskopt = SOF_TIMESTAMPING_TX_HARDWARE |
-				SOF_TIMESTAMPING_RX_HARDWARE |
-				SOF_TIMESTAMPING_RAW_HARDWARE;
+	unsigned int rxskopt = SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE;
 	struct ifreq dev;
 	int fd;
 
@@ -323,7 +340,7 @@ int main(int argc, char **argv)
 
 	signal(SIGALRM, &timeout);
 
-	const struct itimerval timer = {.it_value.tv_sec = 1, .it_value.tv_usec = 0};
+	const struct itimerval timer = {.it_value.tv_sec = 30, .it_value.tv_usec = 0};
 	const struct itimerval stop = {.it_value.tv_sec = 0, .it_value.tv_usec = 0};
 	struct hw_timestamp ts0, ts1;
 	uint64_t diff;
@@ -345,25 +362,25 @@ int main(int argc, char **argv)
 
 			// wait for a replay
 			while (done == false) {  // timeout
-				rxcnt = rx(sock_rx);
+				rxcnt = rx(sock_rx, &ts1);
 				if (rxcnt > 0) {
 					pr_info("captured");
-					res = read_tstamp(sock_rx, &ts1);
 					pr_info("\tts1: %lld.%.9ld", (long long)ts1.hw.tv_sec, ts1.hw.tv_nsec);
+					//res = read_tstamp(sock_rx, &ts1);
 					break;
 				}
 			}
 
 			// stop the timeout
 			setitimer(ITIMER_REAL, &stop, 0);
+
+			// print RTT
+			diff = time_diff(&ts0.hw, &ts1.hw);
+			printf("diff: %ld\n", diff);
 		}
 
 		pr_info("-----------------");
 	}
-
-	// print RTT
-	diff = time_diff(&ts0.hw, &ts1.hw);
-	printf("diff: %ld\n", diff);
 
 	close(sock_tx);
 	close(sock_rx);
