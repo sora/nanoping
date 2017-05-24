@@ -38,7 +38,6 @@ struct hw_timestamp {
 	struct timespec sw;
 };
 
-//#define NDEBUG
 
 static void __attribute__((noreturn)) usage(const char *name)
 {
@@ -59,6 +58,7 @@ static inline uint64_t time_diff(const struct timespec *ts0, const struct timesp
 	return ((1e9 * (ts1->tv_sec - ts0->tv_sec)) + (ts1->tv_nsec - ts0->tv_nsec));
 }
 
+// signal: timeout
 static bool done = false;
 
 static void timeout(int signum)
@@ -66,6 +66,22 @@ static void timeout(int signum)
 	pr_info("timeout");
 	done = true;
 }
+
+// signal: Ctrl-C
+static int caught_signal = 0;
+
+void sig_handler(int sig) {
+	if (sig == SIGINT)
+		caught_signal = 1;
+}
+
+void set_signal(int sig) {
+	if (signal(sig, sig_handler) == SIG_ERR) {
+		fprintf(stderr, "Cannot set signal\n");
+		exit(1);
+	}
+}
+
 
 static ssize_t tx(int sock, struct sockaddr *addr, socklen_t addr_len)
 {
@@ -346,12 +362,17 @@ int main(int argc, char **argv)
 
 	signal(SIGALRM, &timeout);
 
+	set_signal(SIGINT);
+
 	const struct itimerval timer = {.it_value.tv_sec = 3, .it_value.tv_usec = 0};
 	const struct itimerval stop = {.it_value.tv_sec = 0, .it_value.tv_usec = 0};
-	struct hw_timestamp ts0, ts1;
 	uint64_t diff;
 	while (1) {
+		struct hw_timestamp ts0, ts1;
 		ssize_t txcnt, rxcnt;
+
+		if (caught_signal)
+			break;
 		
 		if (ping_mode == LOOPBACK_MODE) {
 			// send the packet
@@ -367,7 +388,7 @@ int main(int argc, char **argv)
 			done = false;
 
 			// wait for a replay
-			while (done == false) {  // timeout
+			while (done == false && !caught_signal) {  // timeout
 				rxcnt = rx(sock_rx, &ts1);
 				if (rxcnt > 0) {
 					pr_info("captured");
