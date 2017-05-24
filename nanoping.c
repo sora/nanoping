@@ -23,6 +23,7 @@
 
 #include "hwtstamp_config.h"
 
+static int debug = 1;
 
 #define likely(x)      __builtin_expect(!!(x), 1)
 #define unlikely(x)    __builtin_expect(!!(x), 0)
@@ -34,7 +35,7 @@
 
 
 struct hw_timestamp {
-	struct timespec ts;
+	struct timespec hw;
 	struct timespec sw;
 };
 
@@ -80,9 +81,9 @@ static ssize_t tx(int sock, struct sockaddr *addr, socklen_t addr_len)
 }
 
 
-static ssize_t _recvpkt(int fd, struct hw_timestamp *hwts, int recvmsg_flags)
+static int __recvmsg(int fd, struct hw_timestamp *ts, int recvmsg_flags)
 {
-	struct timespec *ts = NULL;
+	struct timespec *tstmp = NULL;
 	struct sockaddr_in sin;
 	struct iovec iov;
 	struct msghdr msg = {0};
@@ -90,7 +91,7 @@ static ssize_t _recvpkt(int fd, struct hw_timestamp *hwts, int recvmsg_flags)
 	char buf[256] = {};
 	int level, type;
 	ssize_t count;
-	int res;
+	int res = 0;
 
 	struct cmsghdr *cm;
 
@@ -108,17 +109,18 @@ static ssize_t _recvpkt(int fd, struct hw_timestamp *hwts, int recvmsg_flags)
 		struct pollfd pfd = { fd, POLLPRI, 0 };
 		res = poll(&pfd, 1, 1);
 		if (res < 1) {
-			pr_err("%s: res=%d: %s", "poll: tx timestamp", res, strerror(errno));
-			return res;
+			pr_err("%s: [fd=%d] res=%d: %s", "poll: read_tstamp", fd, res, strerror(errno));
+			goto err;
 		} else if (!(pfd.revents & POLLPRI)) {
 			pr_err("%s: %s", "poll: non ERR event", strerror(errno));
-			return -1;
+			goto err;
 		}
 	}
 
 	count = recvmsg(fd, &msg, recvmsg_flags);
 	if (count < 1) {
 		pr_err("%s: %s", "recvmsg", strerror(errno));
+		goto err;
 	} else {
 		pr_info("recvmsg: success");
 	}
@@ -127,24 +129,23 @@ static ssize_t _recvpkt(int fd, struct hw_timestamp *hwts, int recvmsg_flags)
 		level = cm->cmsg_level;
 		type = cm->cmsg_type;
 		if (level == SOL_SOCKET && type == SO_TIMESTAMPING) {
-			ts = (struct timespec *)CMSG_DATA(cm);	
-		}
-		if (level == SOL_SOCKET && type == SO_TIMESTAMPNS) {
-			//sw = (struct timespec *)CMSG_DATA(cm);	
-			//hwts = *sw;
-			;
+			tstmp = (struct timespec *)CMSG_DATA(cm);	
+			memcpy(&ts->hw, &tstmp[2], sizeof(struct timespec));
+			
+			goto out;
 		}
 	}
 
-	pr_info("ts0: %lld.%.9ld", (long long)ts[0].tv_sec, ts[0].tv_nsec);
-	pr_info("ts1: %lld.%.9ld", (long long)ts[1].tv_sec, ts[1].tv_nsec);
-	pr_info("ts2: %lld.%.9ld", (long long)ts[2].tv_sec, ts[2].tv_nsec);
-	pr_info("ts3: %lld.%.9ld", (long long)ts[3].tv_sec, ts[3].tv_nsec);
-	pr_info("ts4: %lld.%.9ld", (long long)ts[4].tv_sec, ts[4].tv_nsec);
-	pr_info("ts5: %lld.%.9ld", (long long)ts[5].tv_sec, ts[5].tv_nsec);
-	pr_info("ts6: %lld.%.9ld", (long long)ts[6].tv_sec, ts[6].tv_nsec);
+err:
+	res = -1;
 
-	return count;
+out:
+	return res;
+}
+
+static inline int read_tstamp(int fd, struct hw_timestamp *ts)
+{
+	return __recvmsg(fd, ts, MSG_ERRQUEUE);
 }
 
 static ssize_t rx(int fd)
@@ -168,11 +169,6 @@ static ssize_t rx(int fd)
 	return recvmsg(fd, &msg, MSG_DONTWAIT);
 }
 
-static inline ssize_t read_timestamp(int fd, struct hw_timestamp *hwts)
-{
-
-	return _recvpkt(fd, hwts, MSG_ERRQUEUE);
-}
 
 static int txsock_init(const char *ifname, const char *dst, struct sockaddr_in *addr)
 {
@@ -205,12 +201,16 @@ static int txsock_init(const char *ifname, const char *dst, struct sockaddr_in *
 	}
 
 err:
-	pr_info("txfd=%d", fd);
+	pr_debug("txfd=%d", fd);
 	return fd;
 }
 
 static int rxsock_init(const char *ifname, struct sockaddr_in *addr)
 {
+	//unsigned int rxskopt = SOF_TIMESTAMPING_RX_HARDWARE;
+	unsigned int rxskopt = SOF_TIMESTAMPING_TX_HARDWARE |
+				SOF_TIMESTAMPING_RX_HARDWARE |
+				SOF_TIMESTAMPING_RAW_HARDWARE;
 	struct ifreq dev;
 	int fd;
 
@@ -233,8 +233,15 @@ static int rxsock_init(const char *ifname, struct sockaddr_in *addr)
 
 	bind(fd, (struct sockaddr *)addr, sizeof(struct sockaddr));
 
+	if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPING, (char *)&rxskopt, sizeof(rxskopt))) {
+		pr_err("%s: %s", "setsockopt timestamping", strerror(errno));
+	}	
+	if (setsockopt(fd, SOL_SOCKET, SO_SELECT_ERR_QUEUE, (char *)&rxskopt, sizeof(rxskopt))) {
+		pr_err("%s: %s", "setsockopt timestamping", strerror(errno));
+	}
+
 err:
-	pr_info("rxfd=%d", fd);
+	pr_debug("rxfd=%d", fd);
 	return fd;
 }
 
@@ -318,18 +325,19 @@ int main(int argc, char **argv)
 
 	const struct itimerval timer = {.it_value.tv_sec = 1, .it_value.tv_usec = 0};
 	const struct itimerval stop = {.it_value.tv_sec = 0, .it_value.tv_usec = 0};
-	struct hw_timestamp hwts0, hwts1;
+	struct hw_timestamp ts0, ts1;
 	uint64_t diff;
 	while (1) {
-		ssize_t count;
+		ssize_t txcnt, rxcnt;
 		
 		if (ping_mode == PING_MODE) {
 			// send the packet
-			count = tx(sock_tx, (struct sockaddr *)&addr_tx, sizeof(addr_tx));
-
-			// get the TX timestamp from NIC
-			if (count > 0)
-				count = read_timestamp(sock_tx, &hwts0);
+			txcnt = tx(sock_tx, (struct sockaddr *)&addr_tx, sizeof(addr_tx));
+			if (txcnt > 0) {
+				// get the TX timestamp from NIC
+				res = read_tstamp(sock_tx, &ts0);
+				pr_info("\tts0: %lld.%.9ld", (long long)ts0.hw.tv_sec, ts0.hw.tv_nsec);
+			}
 
 			// set a timeout
 			setitimer(ITIMER_REAL, &timer, 0);
@@ -337,9 +345,11 @@ int main(int argc, char **argv)
 
 			// wait for a replay
 			while (done == false) {  // timeout
-				count = rx(sock_rx);
-				if (count > 0) {
+				rxcnt = rx(sock_rx);
+				if (rxcnt > 0) {
 					pr_info("captured");
+					res = read_tstamp(sock_rx, &ts1);
+					pr_info("\tts1: %lld.%.9ld", (long long)ts1.hw.tv_sec, ts1.hw.tv_nsec);
 					break;
 				}
 			}
@@ -352,7 +362,7 @@ int main(int argc, char **argv)
 	}
 
 	// print RTT
-	diff = time_diff(&hwts0.ts, &hwts1.ts);
+	diff = time_diff(&ts0.hw, &ts1.hw);
 	printf("diff: %ld\n", diff);
 
 	close(sock_tx);
