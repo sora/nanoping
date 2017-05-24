@@ -48,6 +48,7 @@ static void __attribute__((noreturn)) usage(const char *name)
 	printf("\t -C ping mode\n");
 	printf("\t -D pong mode\n");
 	printf("\t -H Hardware timestamp mode: <tx or rx or both>\n");
+	printf("\t -L loopback mode\n");
 	printf("\n");
 
 	exit(1);
@@ -265,7 +266,7 @@ err:
 int main(int argc, char **argv)
 {
 	// getopt
-	enum _ping_mode { NO_MODE, PING_MODE, PONG_MODE } ping_mode = NO_MODE;
+	enum _ping_mode { NO_MODE, LOOPBACK_MODE, PING_MODE, PONG_MODE } ping_mode = NO_MODE;
 	enum _rx_mode { NONE, ALL } rx_mode = NONE;
 	enum _tx_mode { OFF, ON } tx_mode = OFF;
 	const char *ifname = 0;
@@ -276,7 +277,7 @@ int main(int argc, char **argv)
 	int res;
 
 	int ch;
-	while ((ch = getopt(argc, argv, "CDi:d:H:")) != -1) {
+	while ((ch = getopt(argc, argv, "CDLi:d:H:")) != -1) {
 		switch (ch) {
 			case 'i':
 				ifname = optarg;
@@ -300,14 +301,19 @@ int main(int argc, char **argv)
 				}
 				break;
 			case 'C':
-				if (ping_mode == PONG_MODE)
+				if (ping_mode != NO_MODE)
 					usage(argv[0]);
 				ping_mode = PING_MODE;
 				break;
 			case 'D':
-				if (ping_mode == PING_MODE)
+				if (ping_mode != NO_MODE)
 					usage(argv[0]);
 				ping_mode = PONG_MODE;
+				break;
+			case 'L':
+				if (ping_mode != NO_MODE)
+					usage(argv[0]);
+				ping_mode = LOOPBACK_MODE;
 				break;
 			default:
 				usage(argv[0]);
@@ -340,14 +346,14 @@ int main(int argc, char **argv)
 
 	signal(SIGALRM, &timeout);
 
-	const struct itimerval timer = {.it_value.tv_sec = 30, .it_value.tv_usec = 0};
+	const struct itimerval timer = {.it_value.tv_sec = 3, .it_value.tv_usec = 0};
 	const struct itimerval stop = {.it_value.tv_sec = 0, .it_value.tv_usec = 0};
 	struct hw_timestamp ts0, ts1;
 	uint64_t diff;
 	while (1) {
 		ssize_t txcnt, rxcnt;
 		
-		if (ping_mode == PING_MODE) {
+		if (ping_mode == LOOPBACK_MODE) {
 			// send the packet
 			txcnt = tx(sock_tx, (struct sockaddr *)&addr_tx, sizeof(addr_tx));
 			if (txcnt > 0) {
@@ -377,6 +383,9 @@ int main(int argc, char **argv)
 			// print RTT
 			diff = time_diff(&ts0.hw, &ts1.hw);
 			printf("diff: %ld\n", diff);
+		} else {
+			pr_err("unknown mode: %d", ping_mode);
+			break;
 		}
 
 		pr_info("-----------------");
